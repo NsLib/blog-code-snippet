@@ -1,0 +1,7 @@
+{
+  "config": {
+    "commitizen": {
+      "path": "cz-customizable"
+    }
+  }
+}
