@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+# pylint: disable=invalid-name
+import datetime
+import argparse
+import os.path
+import re
+import sys
+
+TREE_CHARACTERS = "\u2502 \xa0 \u251c \u2500 \u2514"
+
+_DEBUG_LOG_FILE = "/tmp/nslib_debug.log"
+
+
+def debug_log(msg, with_prefix=False, without_newline=False):
+    with open(_DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        newline = "\n" if not without_newline else ""
+        if with_prefix:
+            f.write(f"[{now}] - [add-index] - {msg}{newline}")
+        else:
+            f.write(f"{msg}{newline}")
+        f.flush()
+
+
+# fmt: off
+
+ANSI_REGEXP = re.compile(
+    r'(\x1b[^m]+m)|(\x1b\[K)'
+)
+COLOURED_LINE_REGEXP = re.compile(
+    r'(?P<prefix>(\x1b[^m]+m)?)'
+    r'(?P<rest>.+)'
+)
+GIT_BRANCH_REGEXP = re.compile(
+    r'(?P<prefix>[ *]{1} {1}(\x1b[^m]+m)?)'
+    r'(?P<indexable>\S.+)'
+)
+GIT_STATUS_SUBMODULE_STATUS_REGEXP = re.compile(
+    r'(?P<line>.+)'
+    r'(?P<rest> \((untracked|modified|new) .+\))'
+)
+GIT_STATUS_REGEXP = re.compile(
+    r'(?P<prefix>\t(\x1b[^m]+m)?([^:]+: +)?)'
+    r'(?P<indexable>.+)'
+)
+LS_PATH_REGEXP = re.compile(
+    r'(?P<directory>.+):'
+)
+LS_REGEXP = re.compile(
+    r'(?P<prefix>([0-9]+ )?([^ ]+ +){8})'
+    r'(?P<indexable>.+)'
+)
+EZA_REGEXP = re.compile(
+    r'^(?P<prefix>(.*?(\x1b\[0m) +){4})(?P<indexable>.+)$'
+    # r'^(?P<prefix>(.*(\x1b\[0m) +)((.*\x1b\[0m) +){3})(?P<indexable>.+)$'
+)
+EZA_SYMBOL_LINK_REGEXP = re.compile(
+    r'^(?P<symbol>.*?) *(\x1b[^m]+m->\x1b\[0m) (?P<target>.*?)$'
+)
+PATH_REGEXP = re.compile(
+    r'[.~]?/'
+)
+
+TREE_REGEXP = re.compile(
+    r'(?P<prefix>[' + TREE_CHARACTERS + ']*(\x1b[^m]+m)?)'
+    r'(?P<rest>.+)'
+)
+
+TREE_SUMMARY_REGEXP = re.compile(
+    r'\d+ directories, \d+ files'
+)
+
+# fmt: on
+
+SUPPORTED_INPUT_TYPES = (
+    "ag",
+    "git_branch",
+    "git_status",
+    "list",
+    "ls_list",
+    "eza_list",
+    "mixed",
+    "tree",
+)
+
+UNDESIRED_BRANCH_PREFIX = "remotes/origin/"
+
+
+def get_arguments():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--input-type",
+        required=True,
+        choices=SUPPORTED_INPUT_TYPES,
+    )
+    parser.add_argument(
+        "--print-indexables",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--relative-paths",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "infile",
+        nargs="?",
+        type=argparse.FileType("r"),
+        default=sys.stdin,
+    )
+    parser.add_argument(
+        "outfile",
+        nargs="?",
+        type=argparse.FileType("w"),
+        default=sys.stdout,
+    )
+    return parser.parse_args()
+
+
+def main():
+    arguments = get_arguments()
+
+    if arguments.input_type == "ag":
+        indexables = parse_ag_input(arguments)
+        maybe_print_indexables(arguments, indexables)
+        return
+    elif arguments.input_type == "git_branch":
+        lines, indexables = parse_git_branch_input(arguments)
+    elif arguments.input_type == "git_status":
+        lines, indexables = parse_git_status_input(arguments)
+    elif arguments.input_type == "list":
+        lines, indexables = parse_list_input(arguments)
+    elif arguments.input_type == "ls_list":
+        lines, indexables = parse_ls_list_input(arguments)
+    elif arguments.input_type == "eza_list":
+        lines, indexables = parse_eza_list_input(arguments)
+    elif arguments.input_type == "mixed":
+        lines, indexables = parse_mixed_input(arguments)
+    elif arguments.input_type == "tree":
+        lines, indexables = parse_tree_input(arguments)
+
+    print_output(arguments, lines, indexables)
+    maybe_print_indexables(arguments, indexables)
+
+
+def parse_ag_input(arguments):
+    indexables = []
+
+    index = 1
+    for line in arguments.infile:
+        clean_line = ANSI_REGEXP.sub("", line).strip()
+        if os.path.exists(clean_line):
+            match = COLOURED_LINE_REGEXP.match(line)
+            if match:
+                arguments.outfile.write(match.group("prefix"))
+                arguments.outfile.write(f"[{index}] ")
+                arguments.outfile.write(match.group("rest"))
+                arguments.outfile.write("\n")
+
+            indexables.append(clean_line)
+            index += 1
+        else:
+            arguments.outfile.write(line)
+
+    return indexables
+
+
+def parse_git_branch_input(arguments):
+    lines = []
+    indexables = []
+
+    for line in arguments.infile:
+        match = GIT_BRANCH_REGEXP.match(line)
+        if not match:
+            lines.append((line, None))
+        else:
+            indexable = match.group("indexable")
+            lines.append((match.group("prefix"), indexable))
+
+            if indexable.startswith(UNDESIRED_BRANCH_PREFIX):
+                indexables.append(indexable[len(UNDESIRED_BRANCH_PREFIX) :])
+            else:
+                indexables.append(indexable)
+
+    return lines, indexables
+
+
+def parse_git_status_input(arguments):
+    lines = []
+    indexables = []
+
+    for line in arguments.infile:
+
+        match = GIT_STATUS_SUBMODULE_STATUS_REGEXP.match(line)
+        if match:
+            line = match.group("line")
+            rest = match.group("rest") or ""
+        else:
+            rest = ""
+
+        match = GIT_STATUS_REGEXP.match(line)
+        if not match:
+            lines.append((line, None))
+        else:
+            indexable = match.group("indexable")
+            lines.append(
+                (match.group("prefix"), indexable, rest),
+            )
+
+            if "renamed" in match.group("prefix"):
+                indexables.append(indexable.split(" -> ")[1])
+            else:
+                indexables.append(indexable)
+
+    return lines, indexables
+
+
+def parse_list_input(arguments):
+    indexables = [line.strip() for line in arguments.infile]
+    lines = [("", indexable) for indexable in indexables]
+    return lines, indexables
+
+
+def parse_ls_list_input(arguments):
+    lines = []
+    indexables = []
+    relative_path = ""
+
+    for line in arguments.infile:
+        path_match = LS_PATH_REGEXP.match(line)
+
+        if path_match and os.path.exists(path_match.group("directory")):
+            relative_path = path_match.group("directory")
+
+        line_match = LS_REGEXP.match(line)
+        if not line_match:
+            lines.append((line, None))
+        else:
+            indexable = line_match.group("indexable")
+            lines.append((line_match.group("prefix"), indexable))
+
+            path = indexable.split(" -> ")[0]
+            if not arguments.relative_paths:
+                path = os.path.abspath(os.path.join(relative_path, path))
+
+            indexables.append(path)
+
+    return lines, indexables
+
+
+def parse_eza_list_input(arguments):
+    lines = []
+    indexables = []
+    relative_path = ""
+
+    for index, line in enumerate(arguments.infile):
+        if index == 0:
+            lines.append((line, None))
+            continue
+
+        path_match = LS_PATH_REGEXP.match(line)
+
+        # debug_log(f"{line}", without_newline=True)
+
+        if path_match and os.path.exists(path_match.group("directory")):
+            relative_path = path_match.group("directory")
+
+        line_match = EZA_REGEXP.match(line)
+        if not line_match:
+            lines.append((line, None))
+        else:
+            indexable = line_match.group("indexable")
+
+            # debug_log(f"Indexable: {indexable}")
+
+            lines.append((line_match.group("prefix"), indexable))
+
+            path = indexable
+            symbol_link_match = EZA_SYMBOL_LINK_REGEXP.match(indexable)
+            if symbol_link_match:
+                path = symbol_link_match.group("symbol")
+
+            if not arguments.relative_paths:
+                path = os.path.abspath(os.path.join(relative_path, path))
+
+            indexables.append(path.replace("'", ""))
+
+    return lines, indexables
+
+
+def parse_mixed_input(arguments):
+    lines = []
+    indexables = []
+
+    for line in arguments.infile:
+        clean_line = ANSI_REGEXP.sub("", line).strip()
+        possible_file = clean_line.split(" ")[0]
+
+        if not os.path.exists(possible_file):
+            if possible_file.endswith(":"):
+                possible_file = possible_file[:-1]
+            possible_file = possible_file.split(":")[0]
+
+        if PATH_REGEXP.match(possible_file) or os.path.exists(possible_file):
+            match = COLOURED_LINE_REGEXP.match(line)
+            lines.append((match.group("prefix"), match.group("rest")))
+            indexables.append(possible_file)
+        else:
+            lines.append((line, None))
+
+    return lines, indexables
+
+
+def parse_tree_input(arguments):
+    lines = []
+    indexables = []
+
+    for line in arguments.infile:
+        match = TREE_REGEXP.match(line)
+        if not match or TREE_SUMMARY_REGEXP.match(line):
+            lines.append((line, None))
+        else:
+            prefix = match.group("prefix")
+            rest = match.group("rest")
+
+            lines.append((prefix.replace(" ", ""), rest))
+            indexables.append(ANSI_REGEXP.sub("", rest).strip())
+
+    return lines, indexables
+
+
+def print_output(arguments, lines, indexables):
+    outfile = arguments.outfile
+
+    padding = len(str(len(indexables))) + 2
+    index = 1
+    for prefix, indexable, *rest in lines:
+        if indexable is None:
+            outfile.write(prefix + "".join(rest))
+        else:
+            index_string = f"[{index}]"
+            fixed_length_index_string = index_string.rjust(padding, " ") + " "
+            outfile.write(
+                prefix
+                + fixed_length_index_string
+                + indexable
+                + "".join(rest)
+                + "\n"
+            )
+            index += 1
+
+
+def maybe_print_indexables(arguments, indexables):
+    outfile = arguments.outfile
+
+    if arguments.print_indexables:
+        outfile.write("@@indexables@@\n")
+        for indexable in indexables:
+            outfile.write(ANSI_REGEXP.sub("", indexable))
+            outfile.write("\n")
+
+
+if __name__ == "__main__":
+    main()

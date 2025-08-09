@@ -1,0 +1,128 @@
+autoload -Uz compinit && compinit
+
+PATH="$HOME/.local/bin:$PATH"
+
+export EZA_CONFIG_DIR=${HOME}/.config/eza
+
+#==============================================================================
+# SCM Breeze 替代
+#==============================================================================
+# 兼容 fzf 补全
+function fzf-or-complete() {
+  if (( $+widgets[fzf-completion] )); then
+    zle fzf-completion
+  else
+    zle expand-or-complete
+  fi
+}
+zle -N fzf-or-complete
+
+# See: https://sblask.github.io/blog/tech/2017/04/10/migrating-away-from-scm-breeze.html
+function __flatten-index-arguments {
+    for argument in $( echo $@ )
+    do
+        if [[ "${argument}" =~ ^[0-9]+-[0-9]+$ ]]
+        then
+            for index in $( eval echo {${argument/-/..}} )
+            do
+                echo ${index}
+            done
+        else
+            echo ${argument}
+        fi
+    done
+}
+
+function __expand-indexes {
+    for index in $( __flatten-index-arguments $@ ); do
+        local index_variable="e${index}"
+        local resolved_index=$( eval echo "\"\${${index_variable}}\"" )
+        if [ "${resolved_index}" != "" ]; then
+            # printf "${resolved_index}" | gnu-sed --regexp-extended "s|([ '\"])|\\\\\1|g"
+            printf "${resolved_index}" | sed -E 's/([ '\''"])/\\\1/g'
+            printf " "
+        else
+            printf ""
+        fi
+    done
+}
+
+function expand-indexes-or-expand-or-complete {
+    local MATCH=$( echo ${LBUFFER} | grep -Eo "(^| )[0-9]+([ -][0-9]+)*$" | sed 's/^ //' 2>/dev/null )
+    if [ "${MATCH}" != "" ]; then
+        local REPLACEMENT=$( __expand-indexes ${MATCH} )
+        if [ "${REPLACEMENT}" != "" ]; then
+            LBUFFER="${LBUFFER/%${MATCH}/${REPLACEMENT}}"
+        else
+            fzf-or-complete
+        fi
+    else
+        fzf-or-complete
+    fi
+}
+
+function set-index-variables() {
+    local input="$(cat -)"
+
+    local old_ifs=$IFS
+    IFS=$'\n'
+
+    local index=1
+    #echo $input | sed --expression '0,/@@indexables@@/d' | while read -r file
+    echo $input | sed -e '1,/@@indexables@@/d' | while read -r file
+    do
+        export e$index="$file"
+        let index++
+    done
+
+    #echo $input | sed --expression '/@@indexables@@/,$d' | while read -r line
+    echo $input | sed -e '/@@indexables@@/,$d' | while read -r line
+    do
+        echo $line
+    done
+
+    IFS=$old_ifs
+}
+
+function __print-path-argument {
+    local path_arguments=()
+    for argument in $@; do
+        if [ -d "${argument}" ]
+        then
+            path_arguments+=("${argument}")
+        fi
+    done
+    # ls prints paths if several are given, but not if it's only one
+    if [[ "${#path_arguments[@]}" -eq "1" ]]; then
+        echo "${path_arguments[1]}:"
+    fi
+}
+
+zle -N expand-indexes-or-expand-or-complete
+bindkey -M viins '^I' expand-indexes-or-expand-or-complete
+bindkey '^I' expand-indexes-or-expand-or-complete
+
+#==============================================================================
+# 这里开始都是按照自己的喜好定义的别名和函数
+#==============================================================================
+function l {
+    { __print-path-argument $@; eza -lah --time-style=long-iso --color=always $@ } \
+        | add-index --input-type eza_list --print-indexables | set-index-variables
+}
+compdef _ls l
+
+function ll {
+    { __print-path-argument $@; eza -lh --time-style=long-iso --color=always $@ } \
+        | add-index --input-type eza_list --print-indexables | set-index-variables
+}
+compdef _ls ll
+
+
+function findu {
+    find $@ | add-index --input-type list --print-indexables | set-index-variables
+}
+compdef _find findu
+
+function gst() {
+    git status $@ | add-index --input-type git_status --print-indexables | set-index-variables
+}
